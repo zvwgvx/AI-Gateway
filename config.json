@@ -1,5 +1,5 @@
 {
-  "ALLOWED_HOSTS": ["api.polydevs.uk"],
+  "ALLOWED_HOSTS": ["0.0.0.0"],
   "TRUSTED_PROXY": ["127.0.0.1"],
   "ALLOWED_PROVIDERS": ["openai", "aistudio", "openrouter", "azure", "anthropic"],
 

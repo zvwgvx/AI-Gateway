@@ -39,7 +39,7 @@ except Exception:
     load_dotenv_fallback(".env")
 
 # -------- Config loader --------
-DEFAULT_CONFIG_PATH = "config.json"
+DEFAULT_CONFIG_PATH = "../config.json"
 
 def load_config(path: Optional[str] = None) -> Dict:
     path = path or os.getenv("CONFIG_PATH") or DEFAULT_CONFIG_PATH
