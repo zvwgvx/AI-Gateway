@@ -1,4 +1,4 @@
-curl -X POST "https://api.polydevs.uk/proxy" \
+curl -X POST "http://0.0.0.0:8100/proxy" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer polydevs_testkey1" \
   -d '{

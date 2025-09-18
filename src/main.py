@@ -1,120 +1,30 @@
 # main.py
 import os
-import json
-from typing import Optional, Set, Dict
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-import uvicorn
 import datetime
 import socket
+from typing import Optional
 from urllib.parse import urlparse
 
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+# Import all configuration variables from the new module
+from load_config import (
+    ALLOWED_HOSTS,
+    TRUSTED_PROXY,
+    ALLOWED_PROVIDERS,
+    CLIENT_KEYS,
+    PROVIDER_API_KEYS,
+    PROVIDER_DEFAULT_MODEL,
+    PROVIDER_ALLOWED_MODELS
+)
 from providers import get_provider_forward
-
-# ---------------- Load .env (try python-dotenv, fallback manual) ----------------
-def load_dotenv_fallback(path: str = ".env"):
-    if not os.path.exists(path):
-        return
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.lower().startswith("export "):
-                line = line.split(" ", 1)[1]
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            # do not override existing env vars
-            if k not in os.environ:
-                os.environ[k] = v
-
-try:
-    # prefer python-dotenv if available
-    from dotenv import load_dotenv
-    load_dotenv()  # loads .env into os.environ
-except Exception:
-    load_dotenv_fallback(".env")
-
-# -------- Config loader --------
-DEFAULT_CONFIG_PATH = "../config.json"
-
-def load_config(path: Optional[str] = None) -> Dict:
-    path = path or os.getenv("CONFIG_PATH") or DEFAULT_CONFIG_PATH
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    return raw
-
-def validate_and_normalize_config(raw: Dict) -> Dict:
-    cfg = {}
-    cfg["ALLOWED_HOSTS"] = set(raw.get("ALLOWED_HOSTS", []))
-    cfg["TRUSTED_PROXY"] = set(raw.get("TRUSTED_PROXY", []))
-    cfg["ALLOWED_PROVIDERS"] = set(raw.get("ALLOWED_PROVIDERS", []))
-
-    provider_env = raw.get("PROVIDER_ENV_NAMES", {})
-    if not isinstance(provider_env, dict):
-        raise ValueError("PROVIDER_ENV_NAMES must be an object/dict in config.json")
-    cfg["PROVIDER_ENV_NAMES"] = {k: str(v) for k, v in provider_env.items()}
-
-    cfg["PROVIDER_DEFAULT_MODEL"] = dict(raw.get("PROVIDER_DEFAULT_MODEL", {}))
-
-    pam = raw.get("PROVIDER_ALLOWED_MODELS", {})
-    if not isinstance(pam, dict):
-        raise ValueError("PROVIDER_ALLOWED_MODELS must be an object/dict in config.json")
-    cfg["PROVIDER_ALLOWED_MODELS"] = {k: set(v if isinstance(v, list) else []) for k, v in pam.items()}
-
-    for p in cfg["ALLOWED_PROVIDERS"]:
-        if p not in cfg["PROVIDER_ENV_NAMES"]:
-            print(f"[warn] provider '{p}' has no PROVIDER_ENV_NAMES entry in config.json")
-    return cfg
-
-# load config at startup (raise if missing)
-try:
-    _raw_cfg = load_config()
-    CFG = validate_and_normalize_config(_raw_cfg)
-except Exception as e:
-    raise RuntimeError(f"Failed to load/validate config.json: {e}")
-
-ALLOWED_HOSTS = CFG["ALLOWED_HOSTS"]
-TRUSTED_PROXY = CFG["TRUSTED_PROXY"]
-ALLOWED_PROVIDERS = CFG["ALLOWED_PROVIDERS"]
-PROVIDER_ENV_NAMES = CFG["PROVIDER_ENV_NAMES"]
-PROVIDER_DEFAULT_MODEL = CFG["PROVIDER_DEFAULT_MODEL"]
-PROVIDER_ALLOWED_MODELS = CFG["PROVIDER_ALLOWED_MODELS"]
-
-# ---------------- Client keys loading ----------------
-def load_client_keys() -> Set[str]:
-    keys = set()
-    env = os.getenv("CLIENT_API_KEYS")
-    if env:
-        for part in env.split(","):
-            k = part.strip()
-            if k:
-                keys.add(k)
-    try:
-        if os.path.exists("clients.keys"):
-            with open("clients.keys", "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    keys.add(line)
-    except Exception:
-        pass
-    return keys
-
-CLIENT_KEYS = load_client_keys()
-
-# ---------------- Load provider upstream keys (from env) ----------------
-PROVIDER_API_KEYS = {p: os.getenv(PROVIDER_ENV_NAMES.get(p, "")) for p in PROVIDER_ENV_NAMES}
 
 # ---------------- App init ----------------
 app = FastAPI(title="LLM API Gateway", version="0.3")
 
+# ---------------- Middleware and Request Validation ----------------
 def normalize_host(host: str) -> str:
     if not host:
         return ""
@@ -151,16 +61,6 @@ async def allow_only_domain_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
-@app.get("/", response_model=dict)
-async def root():
-    return {
-        "ok": True,
-        "now": datetime.datetime.utcnow().isoformat() + "Z",
-        "host": socket.gethostname(),
-        "message": "API Gateway running",
-        "config_loaded": True
-    }
-
 # ---------------- Client auth util ----------------
 def extract_client_key(request: Request) -> Optional[str]:
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
@@ -179,7 +79,17 @@ def check_client_auth(request: Request) -> bool:
         return False
     return key in CLIENT_KEYS
 
-# ---------------- Proxy endpoint with provider+model selection + auth ----------------
+# ---------------- API Endpoints ----------------
+@app.get("/", response_model=dict)
+async def root():
+    return {
+        "ok": True,
+        "now": datetime.datetime.utcnow().isoformat() + "Z",
+        "host": socket.gethostname(),
+        "message": "API Gateway running",
+        "config_loaded": True
+    }
+
 @app.api_route("/proxy", methods=["POST"])
 async def proxy(request: Request):
     if not check_client_auth(request):
