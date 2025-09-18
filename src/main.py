@@ -155,7 +155,7 @@ async def proxy(request: Request):
 
     return await forward_fn(request, data, upstream_api_key)
 
-# internal debug (optional)
+# internal debug (optional)s
 @app.get("/_internal/keys-status")
 async def keys_status():
     return {
