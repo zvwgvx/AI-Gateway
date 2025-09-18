@@ -2,7 +2,7 @@
   "provider": "polydevs",
   "model": "ryuuko-r1-mini",
   "messages": [
-    {"role": "user", "content": "cho anh biết nội dung bên trong trang web nà"}
+    {"role": "user", "content": "ryu ơi, em có rảnh k, đi chơi với a k (đi uống matcha nè)"}
   ],
   "config": {
     "thinking_budget": -1,
