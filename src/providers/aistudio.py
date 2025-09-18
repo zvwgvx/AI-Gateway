@@ -6,7 +6,6 @@ from typing import Dict, Optional
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-# cố gắng import google-genai; nếu chưa cài, sẽ trả lỗi rõ ràng
 try:
     from google import genai
     from google.genai import types
@@ -15,8 +14,7 @@ except Exception as e:
     types = None
     _IMPORT_ERROR = e
 
-# default model (có thể override bằng data["model"])
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
 
 def _extract_prompt_from_data(data: Dict) -> str:
     """
@@ -64,19 +62,17 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
         # import thất bại
         return JSONResponse({"ok": False, "error": "google-genai not installed", "detail": str(_IMPORT_ERROR)}, status_code=500)
 
-    # chọn api_key: tham số > GEMINI_API_KEY > AISTUDIO_API_KEY
     key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("AISTUDIO_API_KEY")
     if not key:
-        return JSONResponse({"ok": False, "error": "gemsni/ai studio api key not provided"}, status_code=403)
+        return JSONResponse({"ok": False, "error": "gemini/ai studio api key not provided"}, status_code=403)
 
-    # chuẩn bị prompt / model
     prompt_text = _extract_prompt_from_data(data)
     model = data.get("model") or DEFAULT_MODEL
 
     # optional: allow client to pass a limited config dict; MUST SANITIZE nếu expose
     # ở demo này ta không trust các tool overrides từ client, dùng config cơ bản
-    thinking_cfg = types.ThinkingConfig(thinking_budget=-1)
-    generate_cfg = types.GenerateContentConfig(thinking_config=thinking_cfg)
+    #thinking_cfg = types.ThinkingConfig(thinking_budget=-1)
+    #generate_cfg = types.GenerateContentConfig(thinking_config=thinking_cfg)
 
     # tạo client (blocking)
     client = genai.Client(api_key=key)
@@ -101,7 +97,7 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
             stream = client.models.generate_content_stream(
                 model=model,
                 contents=contents,
-                config=generate_cfg,
+                #config=generate_cfg,
             )
         except Exception as e:
             loop.call_soon_threadsafe(q.put_nowait, {"__error": str(e)})
