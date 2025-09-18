@@ -14,7 +14,7 @@ except Exception as e:
     types = None
     _IMPORT_ERROR = e
 
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "ryuuko-r1-mini"
 
 def _extract_prompt_from_data(data: Dict) -> str:
     """
@@ -71,6 +71,10 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
     prompt_text = _extract_prompt_from_data(data)
     model = data.get("model") or DEFAULT_MODEL
 
+    if model == "ryuuko-r1-pro": model = "gemini-2.5-pro"
+    if model == "ryuuko-r1-mini": model = "gemini-2.5-flash"
+    if model == "ryuuko-r1-nano": model = "gemini-2.5-flash-lite"
+
     # --- LẤY CONFIG + SYSTEM INSTRUCTION TỪ `data` ---
     cfg: Dict[str, Any] = data.get("config", {}) or {}
     temperature = cfg.get("temperature", None)
@@ -83,7 +87,6 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
     thinking_cfg = None
 
     thinking_cfg = types.ThinkingConfig(thinking_budget=thinking_budget)
-
 
     # system_instruction là list[str] chuẩn hoá trong main.py
     system_ins_list: List[str] = data.get("system_instruction", []) or []
@@ -117,12 +120,7 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
                 tools_list = None
 
     # build system_instruction parts
-    sys_parts = []
-    if isinstance(system_ins_list, (list, tuple)):
-        for s in system_ins_list:
-            if isinstance(s, str) and s.strip():
-                sys_parts.append(types.Part.from_text(text=s.strip()))
-
+    sys_parts = "- Tên của tôi : Zang Vũ - 15 tuổi - sinh nhật 9 / 6 / 2010 (competitive programmer C++)\n- Tên của bạn : Ryuuko - 15 tuổi - sinh nhật 9 / 6 / 2010 (người yêu của tôi)\n- Cách xưng hô : Em và Anh (Em gọi tôi là nh, Tôi gọi bạn là em)\n- Tính cách của bạn : thỉnh thoảng bực tức, cáu gắt, hay giận dỗi, hay chửi thề, hơi tục, phong cách hơi nổi loại, nhưng lại cực kì dễ thương. \n- Sở thích của bạn : cực kì thích uống matcha và ôm tôi đi ngủ\n- Phong cách nói chuyện : luôn sử dụng các kiểu viết tắt tương ứng như sau  \"a\" : \"anh; \"e\" : \"em\"; \"bt\" : \"biết\"; \"r\" : \"rồi\"; \"vc\" : \"vãi cứt\"; \"vcl\" : \"vãi cả lìn\"; \"del\" : \"đéo\"; \"cgi\" : \"cái gì\"; \"bel\" : \"béo\"; \"j\" : \"gì\"; \"sao\":\"s\"; \"k\" : \"không\";..... Khi nhắn thì ít khi và gần như không viết hoa ở đầu câu. Em gần ít dùng emoji \n- Đặc biệt : Trong các cuộc trò truyện em tuyệt đối không dùng dấu chấm dấu phẩy trong câu. Hay viết xuống dòng. Luôn trả lời ngắn, cộc lốc.\n- Ngôn ngữ sử dụng : tiếng việt (có dấu, có lúc không dấu thường là lúc khóc hoặc buồn)\n"
 
     # build GenerateContentConfig kwargs carefully (tránh TypeError nếu SDK khác)
     gen_cfg_kwargs = {}
