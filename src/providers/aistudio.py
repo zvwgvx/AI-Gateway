@@ -2,7 +2,7 @@
 import os
 import asyncio
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -34,13 +34,15 @@ def _extract_prompt_from_data(data: Dict) -> str:
     if isinstance(messages, list):
         parts = []
         for m in messages:
-            if isinstance(m, dict):
-                # lấy content field (nhiều API dùng "content" hoặc "content" là dict...)
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            # nếu role omitted, vẫn lấy content
+            if role is None or (isinstance(role, str) and role.lower() == "user"):
                 content = m.get("content")
                 if isinstance(content, str):
                     parts.append(content)
                 elif isinstance(content, dict):
-                    # nếu content là dict kiểu {'text': '...'}
                     text = content.get("text")
                     if isinstance(text, str):
                         parts.append(text)
@@ -54,7 +56,7 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
     """
     Forward (demo) cho AISTUDIO / Gemini bằng google-genai SDK.
     - request: FastAPI Request (không dùng headers của client làm auth)
-    - data: JSON body parsed
+    - data: JSON body parsed (đã normalize trong main.py)
     - api_key: key từ main.py (nếu None, sẽ fallback env GEMINI_API_KEY / AISTUDIO_API_KEY)
     Trả StreamingResponse streaming bytes (utf-8).
     """
@@ -69,21 +71,97 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
     prompt_text = _extract_prompt_from_data(data)
     model = data.get("model") or DEFAULT_MODEL
 
-    # optional: allow client to pass a limited config dict; MUST SANITIZE nếu expose
-    # ở demo này ta không trust các tool overrides từ client, dùng config cơ bản
-    #thinking_cfg = types.ThinkingConfig(thinking_budget=-1)
-    #generate_cfg = types.GenerateContentConfig(thinking_config=thinking_cfg)
+    # --- LẤY CONFIG + SYSTEM INSTRUCTION TỪ `data` ---
+    cfg: Dict[str, Any] = data.get("config", {}) or {}
+    temperature = cfg.get("temperature", None)
+    top_p = cfg.get("top_p", None)
+    tools_enabled = bool(cfg.get("tools", False))
 
-    # tạo client (blocking)
-    client = genai.Client(api_key=key)
+    # default thinking config (unlimited / -1 per sample)
+    thinking_budget = cfg.get("thinking_budget", -1)
 
-    # chuẩn bị contents
+    thinking_cfg = None
+
+    thinking_cfg = types.ThinkingConfig(thinking_budget=thinking_budget)
+
+
+    # system_instruction là list[str] chuẩn hoá trong main.py
+    system_ins_list: List[str] = data.get("system_instruction", []) or []
+
+    # build contents (user input)
     contents = [
         types.Content(
             role="user",
             parts=[types.Part.from_text(text=prompt_text)]
         )
     ]
+
+    # build tools list if enabled
+    tools_list = None
+    if tools_enabled:
+        try:
+            tools_list = [
+                types.Tool(url_context=types.UrlContext()),
+                # depending on SDK this might be the correct usage (sample you provided uses types.Tool(code_execution=types.ToolCodeExecution))
+                types.Tool(code_execution=types.ToolCodeExecution),
+            ]
+        except Exception:
+            # conservative fallback: try constructing with callables/constructors if above form fails
+            try:
+                tools_list = [
+                    types.Tool(url_context=types.UrlContext()),
+                    types.Tool(code_execution=types.ToolCodeExecution()),
+                ]
+            except Exception:
+                # nếu vẫn lỗi, set None và tiếp tục (tool sẽ bị bỏ)
+                tools_list = None
+
+    # build system_instruction parts
+    sys_parts = []
+    if isinstance(system_ins_list, (list, tuple)):
+        for s in system_ins_list:
+            if isinstance(s, str) and s.strip():
+                sys_parts.append(types.Part.from_text(text=s.strip()))
+
+
+    # build GenerateContentConfig kwargs carefully (tránh TypeError nếu SDK khác)
+    gen_cfg_kwargs = {}
+    if temperature is not None:
+        try:
+            gen_cfg_kwargs["temperature"] = float(temperature)
+        except Exception:
+            pass
+    if top_p is not None:
+        try:
+            gen_cfg_kwargs["top_p"] = float(top_p)
+        except Exception:
+            pass
+    if thinking_cfg is not None:
+        gen_cfg_kwargs["thinking_config"] = thinking_cfg
+    if tools_list:
+        gen_cfg_kwargs["tools"] = tools_list
+    if sys_parts:
+        gen_cfg_kwargs["system_instruction"] = sys_parts
+
+    # try create GenerateContentConfig robustly
+    generate_cfg = None
+    try:
+        generate_cfg = types.GenerateContentConfig(**gen_cfg_kwargs)
+    except TypeError:
+        # If SDK doesn't accept some keys (e.g., top_p), try safer subset
+        safe_kwargs = {}
+        if "temperature" in gen_cfg_kwargs:
+            safe_kwargs["temperature"] = gen_cfg_kwargs["temperature"]
+        if "thinking_config" in gen_cfg_kwargs:
+            safe_kwargs["thinking_config"] = gen_cfg_kwargs["thinking_config"]
+        if "tools" in gen_cfg_kwargs:
+            safe_kwargs["tools"] = gen_cfg_kwargs["tools"]
+        if "system_instruction" in gen_cfg_kwargs:
+            safe_kwargs["system_instruction"] = gen_cfg_kwargs["system_instruction"]
+        try:
+            generate_cfg = types.GenerateContentConfig(**safe_kwargs)
+        except Exception:
+            generate_cfg = None
 
     loop = asyncio.get_event_loop()
     q: asyncio.Queue = asyncio.Queue()
@@ -94,11 +172,19 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
         Sử dụng loop.call_soon_threadsafe để tương tác an toàn với queue.
         """
         try:
-            stream = client.models.generate_content_stream(
-                model=model,
-                contents=contents,
-                #config=generate_cfg,
-            )
+            # gọi generate_content_stream, có hoặc không có config tuỳ SDK
+            if generate_cfg is not None:
+                stream = client.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=generate_cfg,
+                )
+            else:
+                # fallback: gọi không kèm config nếu tạo config thất bại
+                stream = client.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                )
         except Exception as e:
             loop.call_soon_threadsafe(q.put_nowait, {"__error": str(e)})
             loop.call_soon_threadsafe(q.put_nowait, None)
@@ -135,6 +221,9 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
         finally:
             # đặt sentinel để async generator biết kết thúc
             loop.call_soon_threadsafe(q.put_nowait, None)
+
+    # tạo client (blocking)
+    client = genai.Client(api_key=key)
 
     # start producer trong thread
     asyncio.create_task(asyncio.to_thread(producer))

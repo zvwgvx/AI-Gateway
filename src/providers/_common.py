@@ -36,7 +36,7 @@ async def forward_streaming(
     target_url: str,
     req_headers: Dict[str, str],
     request_stream,
-    timeout: float = 30.0,
+    timeout: float = 100.0,
     connect_timeout: float = 5.0,
 ):
     """

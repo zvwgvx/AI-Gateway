@@ -2,7 +2,7 @@
 import os
 import datetime
 import socket
-from typing import Optional
+from typing import Optional, Any, Dict
 from urllib.parse import urlparse
 
 import uvicorn
@@ -22,7 +22,7 @@ from load_config import (
 from providers import get_provider_forward
 
 # ---------------- App init ----------------
-app = FastAPI(title="LLM API Gateway", version="0.3")
+app = FastAPI(title="LLM API Gateway", version="0.4")
 
 # ---------------- Middleware and Request Validation ----------------
 def normalize_host(host: str) -> str:
@@ -78,6 +78,96 @@ def check_client_auth(request: Request) -> bool:
     if not key:
         return False
     return key in CLIENT_KEYS
+
+def _coerce_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.lower() in ("1", "true", "yes", "on")
+    return False
+
+def normalize_request_payload(data: Dict[str, Any]) -> None:
+    """
+    Normalize/validate client-sent fields:
+      - config: {temperature, top_p, tools, thinking_budget}
+      - system_instruction: list[str] (accept str or list)
+    This mutates `data`.
+    """
+    if not isinstance(data, dict):
+        return
+
+    # --- config ---
+    default_temp = 0.7
+    default_top_p = 1.0
+    default_thinking = -1  # default unlimited
+
+    cfg = data.get("config", {}) or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    # temperature
+    temp = cfg.get("temperature", default_temp)
+    try:
+        temp = float(temp)
+    except Exception:
+        temp = default_temp
+    if temp < 0.0:
+        temp = 0.0
+    if temp > 2.0:
+        temp = 2.0
+
+    # top_p
+    top_p = cfg.get("top_p", default_top_p)
+    try:
+        top_p = float(top_p)
+    except Exception:
+        top_p = default_top_p
+    if top_p < 0.0:
+        top_p = 0.0
+    if top_p > 1.0:
+        top_p = 1.0
+
+    # tools (boolean)
+    tools = cfg.get("tools", False)
+    tools = _coerce_bool(tools)
+
+    # thinking_budget: accept -1 (unlimited) or 0..24576, clamp otherwise
+    tb_raw = cfg.get("thinking_budget", default_thinking)
+    try:
+        tb = int(tb_raw)
+    except Exception:
+        tb = default_thinking
+
+    # Normalize
+    if tb == -1:
+        pass
+    else:
+        # any negative other than -1 => treat as -1
+        if tb < 0:
+            tb = default_thinking
+        # clamp upper bound
+        if tb > 24576:
+            tb = 24576
+
+    data["config"] = {
+        "temperature": temp,
+        "top_p": top_p,
+        "tools": tools,
+        "thinking_budget": tb
+    }
+
+    # --- system_instruction ---
+    sys_ins = data.get("system_instruction", [])
+    if isinstance(sys_ins, str):
+        sys_list = [sys_ins]
+    elif isinstance(sys_ins, (list, tuple)):
+        sys_list = [str(x) for x in sys_ins if isinstance(x, (str,))]
+    else:
+        sys_list = []
+    sys_list = [s.strip() for s in sys_list if s and s.strip()]
+    data["system_instruction"] = sys_list
 
 # ---------------- API Endpoints ----------------
 @app.get("/", response_model=dict)
@@ -150,12 +240,17 @@ async def proxy(request: Request):
     if forward_fn is None:
         return JSONResponse({"ok": False, "error": "provider module not implemented"}, status_code=500)
 
+    # ensure model is present in payload
     if isinstance(data, dict):
         data["model"] = requested_model
 
+    # --- NEW: normalize config and system_instruction ---
+    normalize_request_payload(data)
+
+    # finally forward the normalized payload to provider-specific forward
     return await forward_fn(request, data, upstream_api_key)
 
-# internal debug (optional)s
+# internal debug (optional)
 @app.get("/_internal/keys-status")
 async def keys_status():
     return {
