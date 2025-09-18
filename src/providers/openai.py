@@ -2,7 +2,7 @@
 import os
 import asyncio
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -26,7 +26,6 @@ def _extract_messages(data: Dict):
 
     msgs = data.get("messages")
     if isinstance(msgs, list) and msgs:
-        # đảm bảo mỗi item có 'role' và 'content' (string)
         out = []
         for m in msgs:
             if isinstance(m, dict):
@@ -60,9 +59,6 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
     if not key:
         return JSONResponse({"ok": False, "error": "openai api key not provided"}, status_code=403)
 
-    # set api key on SDK client (this is global in openai lib)
-    openai.api_key = key
-
     # model selection
     model = data.get("model") or DEFAULT_MODEL
 
@@ -79,20 +75,89 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
     loop = asyncio.get_event_loop()
     q: asyncio.Queue = asyncio.Queue()
 
+    def _extract_text_from_chunk(chunk: Any):
+        """
+        Normalize a streaming chunk (could be dict-like or object-like) and
+        extract any text pieces from 'delta' or legacy 'text' fields.
+        Returns a string (possibly empty).
+        """
+        text_parts = []
+
+        # try dict-like access
+        def dget(obj, path, default=None):
+            try:
+                cur = obj
+                for p in path:
+                    if cur is None:
+                        return default
+                    if isinstance(cur, dict):
+                        cur = cur.get(p)
+                    else:
+                        cur = getattr(cur, p, None)
+                return cur
+            except Exception:
+                return default
+
+        choices = dget(chunk, ("choices",), []) or []
+        # choices might be a list of dicts or objects
+        for c in choices:
+            delta = dget(c, ("delta",), None)
+            if delta is not None:
+                # delta may be dict or object
+                content = None
+                if isinstance(delta, dict):
+                    content = delta.get("content")
+                else:
+                    content = getattr(delta, "content", None)
+                if content:
+                    text_parts.append(content)
+            # legacy possibility: choices[].text
+            txt = dget(c, ("text",), None)
+            if txt:
+                text_parts.append(txt)
+
+        # some SDK variants put text at the top-level chunk['text']
+        top_text = None
+        if isinstance(chunk, dict):
+            top_text = chunk.get("text")
+        else:
+            top_text = getattr(chunk, "text", None)
+        if top_text:
+            text_parts.append(top_text)
+
+        return "".join(filter(None, text_parts))
+
     def producer():
         """
-        Blocking producer: gọi openai.ChatCompletion.create(..., stream=True) và push chunks vào queue.
-        Lưu ý: openai SDK stream yields "delta" chunks; chúng ta gom text từ 'choices'
+        Blocking producer: call the upstream SDK (new or old) and push chunks into queue.
         """
         try:
-            # For older/newer SDKs, method name may differ; this uses ChatCompletion.create with stream=True
-            # If your SDK version uses client.chat.completions.create or ChatCompletion.acreate, adjust accordingly.
-            resp_iter = openai.ChatCompletion.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                **extra
-            )
+            # Prefer modern OpenAI client if available (openai.OpenAI)
+            if hasattr(openai, "OpenAI"):
+                try:
+                    # instantiate client with api_key (newer SDK supports passing api_key)
+                    client = openai.OpenAI(api_key=key)
+                except TypeError:
+                    # Some older/newer variants might not accept api_key kw; fallback to setting env
+                    client = openai.OpenAI()
+                    os.environ["OPENAI_API_KEY"] = key
+
+                # call new client.chat.completions.create with stream=True
+                resp_iter = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **extra
+                )
+            else:
+                # fallback to legacy openai SDK interface
+                openai.api_key = key
+                resp_iter = openai.ChatCompletion.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    **extra
+                )
         except Exception as e:
             loop.call_soon_threadsafe(q.put_nowait, {"__error": str(e)})
             loop.call_soon_threadsafe(q.put_nowait, None)
@@ -100,24 +165,10 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
 
         # iterate streaming chunks
         try:
-            # resp_iter yields chunks dictionaries
             for chunk in resp_iter:
-                # chunk may contain 'choices' list with 'delta' parts
                 try:
-                    # Many SDKs produce {"choices": [{"delta": {"content": "..."}, "finish_reason": ...}], "id":...}
-                    choices = chunk.get("choices") or []
-                    text_parts = []
-                    for c in choices:
-                        delta = c.get("delta") or {}
-                        # delta may have 'content' or 'role' etc.
-                        content = delta.get("content")
-                        if content:
-                            text_parts.append(content)
-                        # older SDKs may include 'text' directly
-                        if "text" in chunk:
-                            text_parts.append(chunk.get("text"))
-                    if text_parts:
-                        s = "".join(text_parts)
+                    s = _extract_text_from_chunk(chunk)
+                    if s:
                         loop.call_soon_threadsafe(q.put_nowait, s)
                 except Exception:
                     # ignore malformed chunk

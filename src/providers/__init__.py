@@ -4,11 +4,10 @@ from typing import Callable, Dict
 
 # map provider key -> module path
 _PROVIDER_MODULES = {
+    "polydevs": "providers.polydevs",
     "openai": "providers.openai",
-    "openrouter": "providers.openrouter",
     "aistudio": "providers.aistudio",
-    "azure": "providers.azure",
-    "anthropic": "providers.anthropic",
+    "proxyvn": "providers.proxyvn",
 }
 
 # lazy loader: trả về callable forward(request, data, api_key)
