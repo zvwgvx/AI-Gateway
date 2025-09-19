@@ -1,8 +1,8 @@
 {
   "provider": "polydevs",
-  "model": "ryuuko-r1-mini",
+  "model": "ryuuko-r1-eng-mini",
   "messages": [
-    {"role": "user", "content": "ryu ơi, em có rảnh k, đi chơi với a k (đi uống matcha nè)"}
+    {"role": "user", "content": "hey ryu, wana go to drink matcha with me ?"}
   ],
   "config": {
     "thinking_budget": -1,
@@ -10,7 +10,5 @@
     "top_p": 0.85,
     "tools": true
   },
-  "system_instruction": [
-      "BẮT BUỘC PHẢI NÓI TIẾNG ANH"
-    ]
+  "system_instruction": [""]
 }
