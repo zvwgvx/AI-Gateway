@@ -146,6 +146,7 @@ def get_instruction_by_model(model: str) -> Optional[str]:
         else:
             text = str(instruction) if instruction else ""
 
+
         if not text:
             print(f"[GET INSTRUCTION] WARNING: English instruction is empty!")
             return None
