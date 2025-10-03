@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import base64
 from typing import Dict, Optional, Any, List
 from pathlib import Path
 from fastapi import Request
@@ -28,10 +29,10 @@ def load_instructions():
     try:
         # Thử nhiều vị trí có thể
         possible_paths = [
-            Path(__file__).parent / "instructions.json",  # Cùng thư mục với file Python
-            Path.cwd() / "instructions.json",  # Current working directory
-            Path(__file__).parent.parent / "instructions.json",  # Thư mục cha
-            Path.cwd() / "scripts" / "instructions.json",  # Trong scripts folder
+            Path(__file__).parent / "instructions.json",
+            Path.cwd() / "instructions.json",
+            Path(__file__).parent.parent / "instructions.json",
+            Path.cwd() / "scripts" / "instructions.json",
         ]
 
         instruction_file = None
@@ -140,7 +141,6 @@ def get_instruction_by_model(model: str) -> Optional[str]:
         instruction = INSTRUCTIONS.get("english", {})
         if isinstance(instruction, dict):
             text = instruction.get("system_instruction", "")
-            # Handle array format
             if isinstance(text, list):
                 text = "\n".join(text)
         else:
@@ -156,7 +156,6 @@ def get_instruction_by_model(model: str) -> Optional[str]:
         instruction = INSTRUCTIONS.get("vietnamese", {})
         if isinstance(instruction, dict):
             text = instruction.get("system_instruction", "")
-            # Handle array format
             if isinstance(text, list):
                 text = "\n".join(text)
         else:
@@ -169,12 +168,125 @@ def get_instruction_by_model(model: str) -> Optional[str]:
         print(f"[GET INSTRUCTION] Using Vietnamese instruction ({len(text)} chars) for model: {model}")
         return text
 
+
+def _extract_messages_to_contents(messages: List[Dict]) -> List[Any]:
+    """
+    ✅ FIXED: Convert messages array to Gemini Content objects with IMAGE SUPPORT
+    Supports both:
+    - Text-only messages: {"role": "user", "content": "text"}
+    - Multimodal messages: {"role": "user", "parts": [{"text": "..."}, {"inline_data": {...}}]}
+    """
+    contents = []
+
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+
+        role = msg.get("role", "user")
+
+        # Skip system messages (handled separately)
+        if role == "system":
+            continue
+
+        # Map roles: assistant/model -> model for Gemini
+        if role in ("assistant", "model"):
+            gemini_role = "model"
+        else:
+            gemini_role = "user"
+
+        # ✅ CHECK FOR MULTIMODAL MESSAGE (with "parts")
+        if "parts" in msg:
+            parts_array = msg.get("parts", [])
+            if not isinstance(parts_array, list) or not parts_array:
+                continue
+
+            gemini_parts = []
+
+            for part in parts_array:
+                if not isinstance(part, dict):
+                    continue
+
+                # Handle text part
+                if "text" in part:
+                    text_content = part.get("text", "")
+                    if isinstance(text_content, str) and text_content.strip():
+                        gemini_parts.append(types.Part.from_text(text=text_content))
+                        print(f"[MESSAGES] Message {i}: Added text part ({len(text_content)} chars)")
+
+                # ✅ Handle image part (inline_data)
+                elif "inline_data" in part:
+                    inline = part.get("inline_data", {})
+                    if isinstance(inline, dict):
+                        mime_type = inline.get("mime_type")
+                        base64_data = inline.get("data")
+
+                        if mime_type and base64_data:
+                            try:
+                                # Decode base64 to bytes
+                                image_bytes = base64.b64decode(base64_data)
+
+                                # Create image part
+                                image_part = types.Part.from_bytes(
+                                    data=image_bytes,
+                                    mime_type=mime_type
+                                )
+                                gemini_parts.append(image_part)
+                                print(f"[MESSAGES] Message {i}: Added image part ({mime_type}, {len(image_bytes)} bytes)")
+                            except Exception as e:
+                                print(f"[MESSAGES] Error decoding image in message {i}: {e}")
+
+            # Add content if we have valid parts
+            if gemini_parts:
+                try:
+                    contents.append(
+                        types.Content(
+                            role=gemini_role,
+                            parts=gemini_parts
+                        )
+                    )
+                    print(f"[MESSAGES] Added multimodal message {i}: role={gemini_role}, {len(gemini_parts)} parts")
+                except Exception as e:
+                    print(f"[MESSAGES] Error creating Content for multimodal message {i}: {e}")
+
+        # ✅ TEXT-ONLY MESSAGE (backward compatible)
+        elif "content" in msg:
+            content = msg.get("content", "")
+
+            # Convert content to string
+            if isinstance(content, dict):
+                text = content.get("text", "")
+                if not text:
+                    text = json.dumps(content)
+            elif isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                text = "\n".join(text_parts)
+            else:
+                text = str(content)
+
+            # Add to contents if not empty
+            if text.strip():
+                try:
+                    contents.append(
+                        types.Content(
+                            role=gemini_role,
+                            parts=[types.Part.from_text(text=text)]
+                        )
+                    )
+                    print(f"[MESSAGES] Added text message {i}: role={gemini_role}, text_length={len(text)}")
+                except Exception as e:
+                    print(f"[MESSAGES] Error creating Content for text message {i}: {e}")
+
+    return contents
+
+
 def _extract_prompt_from_data(data: Dict) -> str:
     """
-    Lấy prompt từ data:
-    - ưu tiên "prompt" (string)
-    - nếu có "messages" (list of {role, content}) -> nối nội dung của các message có role user
-    - fallback: stringify toàn bộ data
+    Fallback: Extract prompt as string when messages format is not available
     """
     if not isinstance(data, dict):
         return json.dumps(data)
@@ -183,36 +295,13 @@ def _extract_prompt_from_data(data: Dict) -> str:
     if isinstance(prompt, str) and prompt.strip():
         return prompt.strip()
 
-    messages = data.get("messages")
-    if isinstance(messages, list):
-        parts = []
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-            role = m.get("role")
-            # nếu role omitted, vẫn lấy content
-            if role is None or (isinstance(role, str) and role.lower() == "user"):
-                content = m.get("content")
-                if isinstance(content, str):
-                    parts.append(content)
-                elif isinstance(content, dict):
-                    text = content.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-        if parts:
-            return "\n".join(parts)
-
-    # fallback: stringify
     return json.dumps(data)
 
 
 async def forward(request: Request, data: Dict, api_key: Optional[str]):
     """
-    Forward (demo) cho AISTUDIO / Gemini bằng google-genai SDK.
-    - request: FastAPI Request (không dùng headers của client làm auth)
-    - data: JSON body parsed (đã normalize trong main.py)
-    - api_key: key từ main.py (nếu None, sẽ fallback env POLYDEVS_API_KEY)
-    Trả StreamingResponse streaming bytes (utf-8).
+    Forward cho polydevs models using Gemini
+    ✅ FIXED: Now properly handles multimodal messages with images
     """
 
     # Check instructions đã load chưa
@@ -225,159 +314,143 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
         )
 
     if genai is None or types is None:
-        # import thất bại
-        return JSONResponse({"ok": False, "error": "google-genai not installed", "detail": str(_IMPORT_ERROR)},
-                            status_code=500)
+        return JSONResponse(
+            {"ok": False, "error": "google-genai not installed", "detail": str(_IMPORT_ERROR)},
+            status_code=500
+        )
 
     key = api_key or os.getenv("POLYDEVS_API_KEY")
     if not key:
-        return JSONResponse({"ok": False, "error": "gemini/ai studio api key not provided"}, status_code=403)
+        return JSONResponse(
+            {"ok": False, "error": "gemini/ai studio api key not provided"},
+            status_code=403
+        )
 
-    prompt_text = _extract_prompt_from_data(data)
     model = data.get("model") or DEFAULT_MODEL
-    original_model = model  # Lưu lại model gốc để chọn instruction
+    original_model = model
 
     print(f"\n[FORWARD] Processing request with model: {original_model}")
-    print(f"[FORWARD] Prompt: {prompt_text[:100]}..." if len(prompt_text) > 100 else f"[FORWARD] Prompt: {prompt_text}")
 
     # Model mapping cho ryuuko series
-    if model == "ryuuko-r1-vnm-pro": model = "gemini-2.5-pro"
-    if model == "ryuuko-r1-vnm-mini": model = "gemini-2.5-flash"
-    if model == "ryuuko-r1-vnm-nano": model = "gemini-2.5-flash-lite"
+    model_mapping = {
+        "ryuuko-r1-vnm-pro": "gemini-2.5-pro",
+        "ryuuko-r1-vnm-mini": "gemini-2.5-flash",
+        "ryuuko-r1-vnm-nano": "gemini-2.5-flash-lite",
+        "ryuuko-r1-eng-pro": "gemini-2.5-pro",
+        "ryuuko-r1-eng-mini": "gemini-2.5-flash",
+        "ryuuko-r1-eng-nano": "gemini-2.5-flash-lite"
+    }
 
-    if model == "ryuuko-r1-eng-pro": model = "gemini-2.5-pro"
-    if model == "ryuuko-r1-eng-mini": model = "gemini-2.5-flash"
-    if model == "ryuuko-r1-eng-nano": model = "gemini-2.5-flash-lite"
+    if model in model_mapping:
+        model = model_mapping[model]
+        print(f"[FORWARD] Mapped to Gemini model: {model}")
 
-    print(f"[FORWARD] Mapped to Gemini model: {model}")
-
-    # --- LẤY CONFIG TỪ `data` (BỎ QUA system_instruction từ API) ---
+    # Extract config
     cfg: Dict[str, Any] = data.get("config", {}) or {}
     temperature = cfg.get("temperature", None)
     top_p = cfg.get("top_p", None)
     tools_enabled = bool(cfg.get("tools", False))
-
-    # default thinking config (unlimited / -1 per sample)
     thinking_budget = cfg.get("thinking_budget", -1)
 
+    # Build thinking config
     thinking_cfg = None
-    thinking_cfg = types.ThinkingConfig(thinking_budget=thinking_budget)
+    if thinking_budget != -1:
+        thinking_cfg = types.ThinkingConfig(thinking_budget=thinking_budget)
 
-    # build contents (user input)
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=prompt_text)]
-        )
-    ]
+    # ✅ Convert messages to Gemini format with image support
+    messages = data.get("messages", [])
+    contents = []
 
-    # build tools list if enabled
+    if messages:
+        print(f"[FORWARD] Processing {len(messages)} messages from request")
+        contents = _extract_messages_to_contents(messages)
+        print(f"[FORWARD] Converted to {len(contents)} Gemini Content objects")
+
+        # Debug log
+        for i, content in enumerate(contents[:3]):
+            parts_info = []
+            for part in content.parts:
+                if hasattr(part, 'text'):
+                    parts_info.append(f"text:{len(part.text)}chars")
+                elif hasattr(part, 'inline_data'):
+                    parts_info.append(f"image:{part.mime_type if hasattr(part, 'mime_type') else 'unknown'}")
+            print(f"[FORWARD] Content[{i}] role={content.role}, parts=[{', '.join(parts_info)}]")
+    else:
+        # Fallback
+        prompt_text = _extract_prompt_from_data(data)
+        print(f"[FORWARD] No messages found, using prompt: {prompt_text[:100]}...")
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt_text)]
+            )
+        ]
+
+    # Build tools list
     tools_list = None
     if tools_enabled:
         try:
             tools_list = []
 
-            # Ưu tiên Search tools
-            search_added = False
             try:
                 tools_list.append(types.Tool(google_search=types.GoogleSearch()))
-                print("[FORWARD] Added google_search tool (standard)")
-                search_added = True
+                print("[FORWARD] Added google_search tool")
             except Exception as e:
-                print(f"[FORWARD] Failed to add google_search tool (standard): {e}")
-                try:
-                    tools_list.append(types.Tool(google_search={}))
-                    print("[FORWARD] Added google_search tool (empty dict)")
-                    search_added = True
-                except Exception as e2:
-                    print(f"[FORWARD] Failed to add google_search tool (empty dict): {e2}")
+                print(f"[FORWARD] Failed to add google_search: {e}")
 
-            # Thêm URL Context tool
             try:
                 tools_list.append(types.Tool(url_context=types.UrlContext()))
                 print("[FORWARD] Added url_context tool")
             except Exception as e:
-                print(f"[FORWARD] Failed to add url_context tool: {e}")
-                try:
-                    tools_list.append(types.Tool(url_context={}))
-                    print("[FORWARD] Added url_context tool (empty dict)")
-                except Exception as e2:
-                    print(f"[FORWARD] Failed to add url_context tool (empty dict): {e2}")
+                print(f"[FORWARD] Failed to add url_context: {e}")
 
-            # Chỉ thêm Code Execution nếu search đã hoạt động
-            if search_added:
-                try:
-                    tools_list.append(types.Tool(code_execution=types.ToolCodeExecution()))
-                    print("[FORWARD] Added code_execution tool")
-                except Exception as e:
-                    print(f"[FORWARD] Failed to add code_execution tool: {e}")
-                    try:
-                        tools_list.append(types.Tool(code_execution={}))
-                        print("[FORWARD] Added code_execution tool (empty dict)")
-                    except Exception as e2:
-                        print(f"[FORWARD] Failed to add code_execution tool (empty dict): {e2}")
-            else:
-                print("[FORWARD] Skipping code_execution since search tools failed to add")
+            try:
+                tools_list.append(types.Tool(code_execution=types.ToolCodeExecution()))
+                print("[FORWARD] Added code_execution tool")
+            except Exception as e:
+                print(f"[FORWARD] Failed to add code_execution: {e}")
 
             if not tools_list:
-                try:
-                    tools_list = ["google_search", "url_context"]
-                    print("[FORWARD] Using string tool names as fallback (search only)")
-                except Exception as e:
-                    print(f"[FORWARD] String tool names also failed: {e}")
-                    tools_list = None
+                tools_list = None
 
         except Exception as e:
-            print(f"[FORWARD] Error building tools list: {e}")
+            print(f"[FORWARD] Error building tools: {e}")
             tools_list = None
 
-    # Lấy instruction phù hợp dựa trên model gốc
+    # Get instruction
     ryuuko_instruction = get_instruction_by_model(original_model)
 
-    # Check instruction có được load không
     if ryuuko_instruction is None:
-        error_msg = f"Failed to get instruction for model {original_model}. Instructions may not be properly loaded."
+        error_msg = f"Failed to get instruction for model {original_model}"
         print(f"[FORWARD] ERROR: {error_msg}")
         return JSONResponse(
             {"ok": False, "error": "instruction_error", "detail": error_msg},
             status_code=500
         )
 
-    print(f"[FORWARD] Instruction loaded successfully ({len(ryuuko_instruction)} chars)")
-    print(f"[FORWARD] First 200 chars: {ryuuko_instruction[:200]}...")
+    print(f"[FORWARD] Instruction loaded ({len(ryuuko_instruction)} chars)")
 
-    sys_parts = []
-    sys_parts.append(types.Part.from_text(text=ryuuko_instruction.strip()))
+    sys_parts = [types.Part.from_text(text=ryuuko_instruction.strip())]
 
-    # build GenerateContentConfig kwargs
+    # Build GenerateContentConfig
     gen_cfg_kwargs = {}
     if temperature is not None:
-        try:
-            gen_cfg_kwargs["temperature"] = float(temperature)
-        except Exception:
-            pass
+        gen_cfg_kwargs["temperature"] = float(temperature)
     if top_p is not None:
-        try:
-            gen_cfg_kwargs["top_p"] = float(top_p)
-        except Exception:
-            pass
+        gen_cfg_kwargs["top_p"] = float(top_p)
     if thinking_cfg is not None:
         gen_cfg_kwargs["thinking_config"] = thinking_cfg
     if tools_list:
         gen_cfg_kwargs["tools"] = tools_list
-        print(f"[FORWARD] Using {len(tools_list)} tools")
     if sys_parts:
         gen_cfg_kwargs["system_instruction"] = sys_parts
-        print(f"[FORWARD] System instruction added to config")
 
-    # try create GenerateContentConfig robustly
     generate_cfg = None
     try:
         generate_cfg = types.GenerateContentConfig(**gen_cfg_kwargs)
         print("[FORWARD] Created GenerateContentConfig successfully")
     except TypeError as e:
-        print(f"[FORWARD] TypeError creating GenerateContentConfig: {e}")
-        # If SDK doesn't accept some keys (e.g., top_p), try safer subset
+        print(f"[FORWARD] TypeError creating config: {e}")
         safe_kwargs = {}
         if "temperature" in gen_cfg_kwargs:
             safe_kwargs["temperature"] = gen_cfg_kwargs["temperature"]
@@ -389,114 +462,106 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
             safe_kwargs["system_instruction"] = gen_cfg_kwargs["system_instruction"]
         try:
             generate_cfg = types.GenerateContentConfig(**safe_kwargs)
-            print("[FORWARD] Created GenerateContentConfig with safe kwargs")
+            print("[FORWARD] Created config with safe kwargs")
         except Exception as e2:
-            print(f"[FORWARD] Failed to create GenerateContentConfig even with safe kwargs: {e2}")
-            generate_cfg = None
+            print(f"[FORWARD] Failed to create config: {e2}")
 
+    # Create client
+    try:
+        client = genai.Client(api_key=key)
+        print("[FORWARD] Created Gemini client")
+    except Exception as e:
+        print(f"[FORWARD] Error creating client: {e}")
+        return JSONResponse(
+            {"ok": False, "error": "failed_to_create_client", "detail": str(e)},
+            status_code=500
+        )
+
+    # Setup async queue
     loop = asyncio.get_event_loop()
     q: asyncio.Queue = asyncio.Queue()
 
     def producer():
-        """
-        Chạy trong thread—iterate blocking stream của SDK, đẩy các chunk text vào asyncio.Queue
-        """
+        """Run in thread - iterate stream and push to queue"""
         try:
             # Try non-streaming first
             try:
                 if generate_cfg is not None:
-                    debug_response = client.models.generate_content(
+                    response = client.models.generate_content(
                         model=model,
                         contents=contents,
                         config=generate_cfg,
                     )
                 else:
-                    debug_response = client.models.generate_content(
+                    response = client.models.generate_content(
                         model=model,
                         contents=contents,
                     )
-                print(f"[PRODUCER] Non-streaming response structure: {type(debug_response)}")
-                if hasattr(debug_response, 'candidates') and debug_response.candidates:
-                    cand = debug_response.candidates[0]
-                    if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
-                        print(f"[PRODUCER] Number of parts: {len(cand.content.parts)}")
 
-                        # Get complete text
+                if hasattr(response, 'candidates') and response.candidates:
+                    cand = response.candidates[0]
+                    if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
                         complete_text = ""
                         for part in cand.content.parts:
                             if hasattr(part, 'text') and part.text:
                                 complete_text += part.text
 
                         if complete_text.strip():
-                            print(f"[PRODUCER] Sending complete response: {len(complete_text)} chars")
+                            print(f"[PRODUCER] Sending response: {len(complete_text)} chars")
                             loop.call_soon_threadsafe(q.put_nowait, complete_text)
                             loop.call_soon_threadsafe(q.put_nowait, None)
                             return
 
-            except Exception as debug_e:
-                print(f"[PRODUCER] Debug non-streaming call failed: {debug_e}")
+            except Exception as e:
+                print(f"[PRODUCER] Non-streaming failed: {e}")
 
             # Fallback to streaming
-            print("[PRODUCER] Falling back to streaming mode...")
+            print("[PRODUCER] Using streaming mode")
             if generate_cfg is not None:
-                print(f"[PRODUCER] Calling generate_content_stream with model={model}")
                 stream = client.models.generate_content_stream(
                     model=model,
                     contents=contents,
                     config=generate_cfg,
                 )
             else:
-                print(f"[PRODUCER] Calling generate_content_stream without config, model={model}")
                 stream = client.models.generate_content_stream(
                     model=model,
                     contents=contents,
                 )
-        except Exception as e:
-            print(f"[PRODUCER] Error calling generate_content_stream: {e}")
-            loop.call_soon_threadsafe(q.put_nowait, {"__error": str(e)})
-            loop.call_soon_threadsafe(q.put_nowait, None)
-            return
 
-        try:
             chunk_count = 0
             for chunk in stream:
                 chunk_count += 1
                 try:
-                    if not chunk or chunk.candidates is None:
-                        continue
-                    cand = chunk.candidates[0]
-                    if cand is None or cand.content is None or cand.content.parts is None:
+                    if not chunk or not hasattr(chunk, 'candidates') or not chunk.candidates:
                         continue
 
-                    for part in cand.content.parts:
-                        if getattr(part, "text", None) and part.text.strip():
-                            loop.call_soon_threadsafe(q.put_nowait, part.text)
+                    cand = chunk.candidates[0]
+                    if not hasattr(cand, 'content') or not cand.content:
+                        continue
+
+                    if hasattr(cand.content, 'parts'):
+                        for part in cand.content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                loop.call_soon_threadsafe(q.put_nowait, part.text)
 
                 except Exception as chunk_error:
-                    print(f"[PRODUCER] Error processing chunk #{chunk_count}: {chunk_error}")
+                    print(f"[PRODUCER] Error in chunk {chunk_count}: {chunk_error}")
                     continue
+
+            print(f"[PRODUCER] Stream completed: {chunk_count} chunks")
+
         except Exception as e:
-            print(f"[PRODUCER] Error in stream iteration: {e}")
+            print(f"[PRODUCER] Error: {e}")
             loop.call_soon_threadsafe(q.put_nowait, {"__error": str(e)})
         finally:
-            print(f"[PRODUCER] Stream completed after {chunk_count if 'chunk_count' in locals() else 'unknown'} chunks")
             loop.call_soon_threadsafe(q.put_nowait, None)
 
-    # Create client
-    try:
-        client = genai.Client(api_key=key)
-        print("[FORWARD] Created Gemini client successfully")
-    except Exception as e:
-        print(f"[FORWARD] Error creating Gemini client: {e}")
-        return JSONResponse({"ok": False, "error": "failed_to_create_client", "detail": str(e)}, status_code=500)
-
-    # Start producer in thread
+    # Start producer
     asyncio.create_task(asyncio.to_thread(producer))
 
     async def streamer():
-        """
-        Async generator: yield bytes để StreamingResponse trả về.
-        """
+        """Async generator for streaming response"""
         try:
             while True:
                 item = await q.get()
@@ -506,13 +571,14 @@ async def forward(request: Request, data: Dict, api_key: Optional[str]):
                     err = item.get("__error")
                     yield (json.dumps({"ok": False, "error": "upstream_error", "detail": err}) + "\n").encode("utf-8")
                     break
-                if not isinstance(item, (str, bytes)):
-                    item = str(item)
+
                 if isinstance(item, str):
-                    b = item.encode("utf-8")
+                    yield item.encode("utf-8")
+                elif isinstance(item, bytes):
+                    yield item
                 else:
-                    b = item
-                yield b
+                    yield str(item).encode("utf-8")
+
         except asyncio.CancelledError:
             return
 
