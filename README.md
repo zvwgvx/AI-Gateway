@@ -1,2 +1,1 @@
-# AI Gateway
-No more support
+# No longer supported
